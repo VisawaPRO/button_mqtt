@@ -1,5 +1,3 @@
-/* MQTT (over TCP) and Button Example */
-
 #include <stdio.h>
 #include <stdint.h>
 #include <stddef.h>
@@ -26,6 +24,7 @@
 
 // Define constants
 #define BUTTON_GPIO 23
+#define LED_GPIO 19       // Define GPIO for the LED
 #define ESP_INTR_FLAG_DEFAULT 0  // Manually define ESP_INTR_FLAG_DEFAULT
 
 static const char *TAG = "mqtt_example";
@@ -34,15 +33,41 @@ esp_mqtt_client_handle_t client;  // Global MQTT client handle
 
 // Function prototypes
 static void button_init(void);
+static void led_init(void);
 static void IRAM_ATTR button_isr_handler(void *arg);
 static void button_task(void *arg);
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data);
 static void mqtt_app_start(void);
+static void led_control(const char *message, int length);
 
 static void log_error_if_nonzero(const char *message, int error_code)
 {
     if (error_code != 0) {
         ESP_LOGE(TAG, "Last error %s: 0x%x", message, error_code);
+    }
+}
+
+/*
+ * @brief Control LED based on received MQTT message
+ */
+static void led_control(const char *message, int length)
+{
+    char trimmed_message[32];  // Adjust size as necessary
+    int message_length = length < sizeof(trimmed_message) ? length : sizeof(trimmed_message) - 1;
+
+    // Copy and null-terminate the message
+    strncpy(trimmed_message, message, message_length);
+    trimmed_message[message_length] = '\0';
+
+    ESP_LOGI(TAG, "LED control message: %s (length: %d)", trimmed_message, strlen(trimmed_message));
+    if (strcmp(trimmed_message, "ON") == 0) {
+        gpio_set_level(LED_GPIO, 1); // Turn LED on
+        ESP_LOGI(TAG, "LED is ON");
+    } else if (strcmp(trimmed_message, "OFF") == 0) {
+        gpio_set_level(LED_GPIO, 0); // Turn LED off
+        ESP_LOGI(TAG, "LED is OFF");
+    } else {
+        ESP_LOGW(TAG, "Received unexpected message for LED control: %s", trimmed_message);
     }
 }
 
@@ -56,6 +81,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     switch ((esp_mqtt_event_id_t)event_id) {
     case MQTT_EVENT_CONNECTED:
         ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
+        esp_mqtt_client_subscribe(client, "KMITL/SIET/65030229/LED", 1); // Subscribe to the LED control topic
         break;
     case MQTT_EVENT_DISCONNECTED:
         ESP_LOGI(TAG, "MQTT_EVENT_DISCONNECTED");
@@ -64,13 +90,19 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         ESP_LOGI(TAG, "MQTT_EVENT_DATA");
         printf("TOPIC=%.*s\r\n", event->topic_len, event->topic);
         printf("DATA=%.*s\r\n", event->data_len, event->data);
+
+        // Check if the received topic is for the LED control
+        if (strncmp(event->topic, "KMITL/SIET/65030229/LED", event->topic_len) == 0) {
+            // Control LED based on the received message
+            led_control((const char *)event->data, event->data_len);
+        }
         break;
     case MQTT_EVENT_ERROR:
         ESP_LOGI(TAG, "MQTT_EVENT_ERROR");
         if (event->error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT) {
             log_error_if_nonzero("reported from esp-tls", event->error_handle->esp_tls_last_esp_err);
             log_error_if_nonzero("reported from tls stack", event->error_handle->esp_tls_stack_err);
-            log_error_if_nonzero("captured as transport's socket errno",  event->error_handle->esp_transport_sock_errno);
+            log_error_if_nonzero("captured as transport's socket errno", event->error_handle->esp_transport_sock_errno);
             ESP_LOGI(TAG, "Last errno string (%s)", strerror(event->error_handle->esp_transport_sock_errno));
         }
         break;
@@ -99,16 +131,31 @@ static void button_init(void)
 }
 
 /*
+ * @brief Initializes GPIO for the LED
+ */
+static void led_init(void)
+{
+    gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT); // Set LED GPIO as output
+}
+
+/*
  * @brief ISR handler for button press
  */
 static void IRAM_ATTR button_isr_handler(void *arg)
 {
-    // Check the current level of the button and create a task to handle publishing
-    if (gpio_get_level(BUTTON_GPIO) == 0) { // Button pressed
-        xTaskCreate(button_task, "button_task", 2048, (void *)"ON", 10, NULL);
-    } else { // Button released
-        xTaskCreate(button_task, "button_task", 2048, (void *)"OFF", 10, NULL);
+    static uint32_t last_isr_time = 0;
+    uint32_t current_time = xTaskGetTickCountFromISR();
+    
+    // Debounce logic
+    if (current_time - last_isr_time > pdMS_TO_TICKS(50)) {
+        if (gpio_get_level(BUTTON_GPIO) == 0) { // Button pressed
+            xTaskCreate(button_task, "button_task", 2048, (void *)"1", 10, NULL);
+        } else { // Button released
+            xTaskCreate(button_task, "button_task", 2048, (void *)"0", 10, NULL);
+        }
     }
+    
+    last_isr_time = current_time;
 }
 
 /*
@@ -145,8 +192,9 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     ESP_ERROR_CHECK(example_connect());
 
-    // Initialize button
+    // Initialize button and LED
     button_init();
+    led_init();
 
     // Start MQTT client
     mqtt_app_start();
